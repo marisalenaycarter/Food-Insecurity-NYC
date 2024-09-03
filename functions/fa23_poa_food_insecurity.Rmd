@@ -1,0 +1,1376 @@
+---
+title: "F23 Food Insecurity"
+author: "Marisa"
+output:
+ pdf_document:
+    toc: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=TRUE, fig.align='center')
+
+library(readr)
+library(cli)
+library(googledrive)
+library(readxl)
+library(tidyverse)
+library(stringr)
+library(haven)
+library(rjson)
+library(googlesheets4)
+library(knitr)
+library(dplyr)
+require(scales)
+
+gs4_found <- gs4_find()
+target_census <- gs4_found %>% filter(str_detect(name, "target_demographics_fa23"))
+
+
+source("../../code/default_setup.R")
+wrangled <- read_csv("../../data/output/wrangled.csv")
+
+wrangled <- wrangled %>% filter(!is.na(borough)) %>%
+  mutate(race_census = ifelse(grepl("indigenous", race_census), "else",
+                              race_census)) %>%
+  mutate(race_census = ifelse(grepl("native", race_census), "else",
+                              race_census)) %>%
+  mutate(race_census = ifelse(grepl("other", race_census), "else",
+                              race_census)) %>%
+  mutate(race_census = ifelse(grepl("two", race_census), "else",
+                              race_census)) %>%
+  mutate(race_census = ifelse(grepl("asian", race_census), "asian",
+                              race_census)) %>%
+  mutate(race_census = ifelse(is.na(race_census), "else", race_census)) %>%
+  mutate(race_boro = paste(race_census, borough, sep = "_"))
+
+# race weighting
+race_target_census <- target_census %>% pull(id) %>% read_sheet(sheet = "Race")
+race_weights <- race_target_census[
+  !is.na(race_target_census$race_weight), c("label", "race_weight")] %>%
+  rename(race_census = label) %>%
+  # only weighting black, white, hispanic, asian
+  filter(!grepl("indigenous|native|other|two", race_census))
+  
+# borough weighting
+borough_target_census <- target_census %>% pull(id) %>% read_sheet(sheet = "Borough")
+borough_weights <- borough_target_census[
+  !is.na(borough_target_census$borough_weight), c("label", "borough_weight")] %>% 
+  rename(borough = label)
+
+# race+borough weighting
+race_boro_target_census <- target_census %>% pull(id) %>% read_sheet(sheet = "race_boro")
+race_boro_weights <- race_boro_target_census[
+  !is.na(race_boro_target_census$race_boro_weight), c("label", "race_boro_weight")] %>% 
+  rename(race_boro = label)
+
+# demographics
+wrangled <- wrangled %>% 
+  mutate(
+    # gender = ifelse(gen == 1, "male", 
+    #               ifelse(gen == 2, "female", 
+    #               ifelse(gen == 3, "genderqueer/gender non-conforming",
+    #               ifelse(gen == 4, "trans male/trans man", 
+    #               ifelse(gen == 5, "other", 
+    #               ifelse(gen == 6, "prefer not to say",
+    #               ifelse(gen == 7, "trans female/trans woman", NA))))))),
+         # inc_level = ifelse(inc_dist == 1, "HH income below $36500", 
+         #             ifelse(inc_dist == 2, "HH income between $36500 and $69500",
+         #             ifelse(inc_dist == 3, "HH income above $69500", NA))),
+         # below_poverty = ifelse(below_poverty_bi == 0, "Above Poverty Level", 
+         #                 ifelse(below_poverty_bi == 1, "Below Poverty Level", NA)),
+         # below_median = ifelse(inc_be_med == 0, "Above Median Income", 
+         #                 ifelse(inc_be_med == 1, "Below Median Income", NA)),
+         # hh_child = ifelse(hh_ch_0_17_bi == 0, "No children in household", 
+         #            ifelse(hh_ch_0_17_bi == 1, "Has children in household", NA)),
+         hh_ch_yg = ifelse((hh_ch_0_2_bi==1|hh_ch_3_5_bi==1), "Has young children",
+                    ifelse((hh_ch_0_2_bi!=1&hh_ch_3_5_bi!=1),"No young children",NA)),
+         # hh_elderly = ifelse(hh_sn_65_bi == 0, "No senior citizens in household", 
+         #              ifelse(hh_sn_65_bi == 1, "Has senior citizens in household", NA)),
+         sr = ifelse(age>=65,"Respondent is a senior",ifelse(age<65,"Respondent is not a senior",NA)),
+         whole_pop = ifelse(resi_ny == 1, "New Yorker", NA),
+         # hh_disability = ifelse(disab%in%c(1,2),"Has disability",ifelse(disab%in%c(3,4),"Does not have disability",NA)),
+         sing_hh = ifelse(hh_ad_one==1&hh_ch_0_17_bi==0,"Single person household",ifelse(hh_ad_one==0,"More than one person",NA)), # no children
+         sing_par = ifelse(hh_ad_one==1&hh_ch_0_17_bi==1,"Single parent household",ifelse(hh_ad_one==0|hh_ch_0_17_bi==0,"Not a single parent household",NA)), # single adult with children
+         lgbtqia = ifelse((gen %in% c(4,5,7) | sex %in% c(2,3,4,6)), "Is LGBTQIA+", ifelse(is.na(gen)&is.na(sex),NA,"Is not LGBTQIA+")),
+         # language = ifelse(lang==1,"Speaks other language",ifelse(lang==0,"Speaks only English",NA)),
+         above_avg_stress=ifelse(stress_bi==1,"Above average stress",ifelse(stress_bi==0,"Below average stress",NA))
+         )
+
+# food insecurity and severe food insecurity
+wrangled <- wrangled %>%
+  mutate(food_insecurity = ifelse(diff_access_food==1 | diff_afford_food==1, 1, 0),
+         food_ins_sev = ifelse(food_insecurity==1 & 
+                                 (insecure_food_ran_out==1 | insecure_food_worr==1), 1, 0))
+```
+
+## 1. Demographics of respondents who experienced food insecurity and severe food insecurity in the past year
+### 1.1. Food insecurity
+#### 1.1.1. Overall weighted (race, borough, race&borough) and unweighted
+
+```{r}
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = wrangled, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = wrangled,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = wrangled,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_dt <- wrangled %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+#### 1.1.2. Weighted subgroups
+
+```{r}
+food_ins_demos <- make_demographic_tables(wrangled, demographics, "food_insecurity", 
+                               race_weights, "race_weight",
+                               borough_weights, "borough_weight",
+                               race_boro_weights, "race_boro_weight")
+```
+
+```{r, include=FALSE}
+make_weighted_plots(wrangled, demographics, "food_insecurity", race_weights, "race_weight")
+```
+
+#### 1.1.3. Comparing subgroups
+
+```{r}
+make_plots(wrangled, "gender", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "race_census", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "hh_child", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "hh_ch_yg", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity") # no significant pairwise difference in proportions
+```
+
+```{r}
+make_plots(wrangled, "hh_elderly", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "sr", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "below_median", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "lgbtqia", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "hh_disability", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "english_lang", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "sing_hh", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity") # no significant pairwise difference in proportions
+```
+
+```{r}
+make_plots(wrangled, "sing_par", "food_insecurity", 
+           title = "Proportion of respondents who experienced food insecurity")
+```
+
+### 1.2. Severe food insecurity
+#### 1.2.1. Overall weighted (race, borough, race&borough) & unweighted
+
+```{r}
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = wrangled, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = wrangled,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = wrangled,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_dt <- wrangled %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+#### 1.2.2. Race-weighted subgroups
+
+```{r}
+food_ins_sev_demos <- make_demographic_tables(wrangled, demographics, "food_ins_sev", 
+                               race_weights, "race_weight",
+                               borough_weights, "borough_weight",
+                               race_boro_weights, "race_boro_weight")
+```
+
+```{r, include=FALSE}
+make_weighted_plots(wrangled, demographics, "food_ins_sev", race_weights, "race_weight")
+```
+
+#### 1.2.3. Comparing subgroups
+
+```{r}
+make_plots(wrangled, "gender", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "race_census", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "hh_child", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "hh_ch_yg", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity") # no significant pairwise difference in proportions
+```
+
+```{r}
+make_plots(wrangled, "hh_elderly", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "sr", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "below_median", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "lgbtqia", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "hh_disability", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "english_lang", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+```{r}
+make_plots(wrangled, "sing_hh", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity") # # no significant pairwise difference in proportions
+```
+
+```{r}
+make_plots(wrangled, "sing_par", "food_ins_sev", 
+           title = "Proportion of respondents who experienced severe food insecurity")
+```
+
+## 2. Households with children were more likely to experience food insecurity in the past year
+
+### 2.1. Households with children (0-17)
+
+#### 2.1.1. Food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(hh_ch_0_17_bi==1)
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_hh_child <- temp1 %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+#### 2.1.2. Severe food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(hh_child=="Has children in household")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_hh_child <- temp1 %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+```{r, include=FALSE}
+temp1 <- wrangled %>%
+  filter(!is.na(hh_child) & !is.na(food_ins_sev)) %>%
+  left_join(race_weights, by = "race_census") %>%
+  mutate(weighted_value = food_ins_sev * race_weight) %>%
+  group_by(hh_child, food_ins_sev) %>%
+  summarise(n = n(),
+            weighted_n = sum(race_weight,na.rm=TRUE)) %>%
+  mutate(total_n = sum(n),
+         weighted_total_n = sum(weighted_n,na.rm=TRUE),
+         percent = scales::percent(n/sum(n), accuracy = .1),
+         weighted_percent = scales::percent(weighted_n/weighted_total_n, accuracy = .1)) %>%
+  ungroup() %>%
+  mutate_if(is.labelled, to_character) %>%
+  filter(hh_child=="Has children in household")
+#weighted total n vs total n?? total n gives same as above
+
+print(temp1)
+
+```
+
+### 2.2. Households with young children (0-5)
+#### 2.2.1. Food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(hh_ch_yg=="Has young children")
+
+# Calculate weighted figures
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_hh_ch_yg <- temp1 %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+#### 2.2.2. Severe food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(hh_ch_yg=="Has young children")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_hh_ch_yg <- temp1 %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+```{r, include=FALSE}
+wrangled %>% filter(!is.na(food_ins_sev)&!is.na(hh_ch_yg)) %>%
+  mutate(food_ins_sev=ifelse(food_ins_sev==1,"Severely food insecure","Not severely food insecure")) %>%
+  group_by(hh_ch_yg,food_ins_sev) %>%
+  summarize(count=n()) %>%
+  group_by(hh_ch_yg) %>%
+  mutate(per = count/sum(count),total = sum(count)) %>%
+  ggplot(aes(food_ins_sev,per,fill=hh_ch_yg)) +
+  scale_y_continuous(labels=percent) +
+  geom_bar(stat='identity',position=position_dodge()) +
+  geom_text(aes(label = paste0(round(100 * per, 2), "%")),
+            position = position_dodge(width = 0.9),
+            vjust = -0.5)
+```
+
+## 3. Households with a language other than English spoken at home were more likely to experience food insecurity
+### 3.1. Food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(english_lang=="Other langugage spoken at home")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_language <- temp1 %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+### 3.2. Severe food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(english_lang=="Other language spoken at home")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_language <- temp1 %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+## 4. Seniors and households with seniors were more likely to experience food insecurity
+### 4.1. Seniors
+#### 4.1.1. Food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(sr=="Respondent is a senior")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sr <- temp1 %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+#### 4.1.2. Severe food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(sr=="Respondent is a senior")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_sr <- temp1 %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+### 4.2. Households with seniors
+#### 4.2.1. Food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(hh_elderly=="Has senior citizens in household")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_hh_elderly <- temp1 %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+#### 4.2.2. Severe food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(hh_elderly=="Has senior citizens in household")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_hh_elderly <- temp1 %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+## 5. Single-person and single-parent households were more likely to experience food insecurity
+
+(added single-parent households to this hypothesis)
+
+### 5.1. Single-person households
+#### 5.1.1. Food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(sing_hh=="Single person household")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sing_hh <- temp1 %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+#### 5.1.2. Severe food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(sing_hh=="Single person household")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_sing_hh <- temp1 %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+### 5.2. Single-parent households
+#### 5.2.1. Food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(sing_par=="Single parent household")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sing_par <- temp1 %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+#### 5.2.2. Severe food insecurity
+
+```{r}
+temp1 <- wrangled %>% filter(sing_par=="Single parent household")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_sing_par <- temp1 %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+## 6. Food-insecure respondents had higher stress levels
+### 6.1. Food insecurity
+
+```{r}
+wrangled %>% filter(!is.na(food_insecurity)&!is.na(stress_score)) %>%
+  mutate(food_insecurity=ifelse(food_insecurity==1,"Food insecure","Not food insecure")) %>%
+  group_by(food_insecurity) %>%
+  summarize(Avg_stress=mean(stress_score))
+```
+
+```{r}
+temp1 <- wrangled %>% filter(above_avg_stress=="Above average stress")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_insecurity", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced food insecurity", 
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_insecurity",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced food insecurity",
+  label_false = "did not experience food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_above_avg_stress <- temp1 %>%
+  group_by(not_blank = !is.na(food_insecurity), food_insecurity) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_insecurity") %>%
+  left_join(temp2, by = "food_insecurity") %>%
+  left_join(temp3, by = "food_insecurity") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+### 6.2. Severe food insecurity
+
+```{r}
+wrangled %>% filter(!is.na(food_ins_sev)&!is.na(stress_score)) %>%
+  mutate(food_ins_sev=ifelse(food_ins_sev==1,"Severely food insecure","Not severely food insecure")) %>%
+  group_by(food_ins_sev) %>%
+  summarize(Avg_stress=mean(stress_score))
+```
+
+```{r}
+temp1 <- wrangled %>% filter(above_avg_stress=="Above average stress")
+
+# Calculate race weighted figures
+temp <- calculate_weighted_nyc_race(
+  df = temp1, 
+  var_name = "food_ins_sev", 
+  weights_df = race_weights, 
+  weight_var = "race_weight", 
+  label_true = "experienced severe food insecurity", 
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(race_wt_percent = percent,
+         race_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp2 <- calculate_weighted_nyc_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = borough_weights,
+  weight_var = "borough_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(boro_wt_percent = percent,
+         boro_wt_n = total_weighted_n)
+
+# Calculate race borough weighted figures
+temp3 <- calculate_weighted_nyc_race_boro(
+  df = temp1,
+  var_name = "food_ins_sev",
+  weights_df = race_boro_weights,
+  weight_var = "race_boro_weight",
+  label_true = "experienced severe food insecurity",
+  label_false = "did not experience severe food insecurity"
+  ) %>%
+  rename(raceboro_wt_percent = percent,
+         raceboro_wt_n = total_weighted_n)
+
+# Combine weighted w/ unweighted
+food_ins_sev_above_avg_stress <- temp1 %>%
+  group_by(not_blank = !is.na(food_ins_sev), food_ins_sev) %>%
+  summarise(n = n()) %>%
+  mutate(total_n = sum(n),
+         percent = round(n/sum(n), 2)) %>%
+  left_join(temp, by = "food_ins_sev") %>%
+  left_join(temp2, by = "food_ins_sev") %>%
+  left_join(temp3, by = "food_ins_sev") %>%
+  filter(not_blank == 1) %>%
+  mutate_if(is.labelled, to_character) %>%
+  ungroup() %>%
+  select(label, total_n, n, percent, race_wt_n, race_wt_percent, boro_wt_n, boro_wt_percent, raceboro_wt_n, raceboro_wt_percent)
+```
+
+## (Saving results to Excel)
+
+```{r}
+resultsList <- c(list("overall" = food_ins_dt), food_ins_demos)
+
+save_results_to_excel(resultsList, "3.1. Experienced food insecurity.xlsx")
+```
+
+```{r}
+resultsList <- c(list("overall" = food_ins_sev_dt), food_ins_sev_demos)
+
+save_results_to_excel(resultsList, "3.1. Experienced severe food insecurity.xlsx")
+```
+
+```{r}
+save_results_to_excel(list("food insecurity"=food_ins_hh_child,
+                           "severe food insecurity"=food_ins_sev_hh_child), "3.1.a. Households with children.xlsx")
+```
+
+```{r}
+save_results_to_excel(list("food insecurity"=food_ins_language,
+                           "severe food insecurity"=food_ins_sev_language), "3.1.b. Speaks language other than English.xlsx")
+```
+
+```{r}
+save_results_to_excel(list("food insecurity"=food_ins_sr,
+                           "severe food insecurity"=food_ins_sev_sr), "3.1.c. Seniors.xlsx")
+```
+
+```{r}
+save_results_to_excel(list("food insecurity"=food_ins_hh_elderly,
+                           "severe food insecurity"=food_ins_sev_hh_elderly), "3.1.c. Households with seniors.xlsx")
+```
+
+```{r}
+save_results_to_excel(list("food insecurity"=food_ins_sing_hh,
+                           "severe food insecurity"=food_ins_sev_sing_hh), "3.1.d. Single adult households.xlsx")
+```
+
+```{r}
+save_results_to_excel(list("food insecurity"=food_ins_sing_par,
+                           "severe food insecurity"=food_ins_sev_sing_par), "3.1.d. Single parent households.xlsx")
+```
+
+```{r}
+save_results_to_excel(list("food insecurity"=food_ins_above_avg_stress,
+                           "severe food insecurity"=food_ins_sev_above_avg_stress), "3.1.e. Above average stress levels.xlsx")
+```
