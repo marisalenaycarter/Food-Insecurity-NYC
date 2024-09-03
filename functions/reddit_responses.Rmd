@@ -1,0 +1,199 @@
+---
+title: "f23 reddit vs non reddit"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Notebook Setup
+```{r message=FALSE, warning=FALSE}
+# Load packages
+library(googledrive)
+library(readxl)
+library(tidyverse)
+library(stringr)
+library(haven)
+library(rjson)
+library(googlesheets4)
+
+# Set working directory
+setwd("~/GitHub/Survey-Analysis-Repository/sp24")
+
+# Read in custom functions
+source("code/functions/make_codebook.R")
+source("code/default_setup.R")
+```
+
+## Load data
+```{r message=FALSE, warning=FALSE}
+# Load most recently created wrangled data
+wrangled <- read_csv("../data/output/wrangled.csv")
+wrangled <- wrangled %>%
+  mutate(reddit=ifelse(str_detect(source, "r/"), "reddit","non-reddit")) %>%
+  mutate(reddit=ifelse(is.na(reddit),"non-reddit",reddit))
+
+table(wrangled$reddit)
+```
+## Gender
+
+```{r}
+wrangled %>%
+  group_by(reddit,gender) %>%
+  summarize(count=n()) %>%
+  group_by(reddit)%>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+## Sexuality
+
+```{r}
+wrangled %>%
+  group_by(reddit,sex) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## LGBTQ
+
+```{r}
+wrangled %>%
+  group_by(reddit,lgbtq) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Borough
+
+```{r}
+wrangled %>%
+  group_by(reddit,borough) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Race
+
+```{r}
+wrangled %>%
+  group_by(reddit,race_census) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Income
+
+```{r}
+wrangled %>%
+  group_by(reddit,income) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+## Religion
+
+```{r}
+wrangled %>%
+  group_by(reddit,relig) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+## Age
+
+```{r}
+wrangled %>%
+  group_by(reddit) %>%
+  summarize(mean=mean(age),median=median(age),sd=sd(age))
+```
+
+## Marital status
+
+```{r}
+wrangled %>%
+  group_by(reddit,mar) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Highest degree
+
+```{r}
+wrangled %>%
+  group_by(reddit,sch_level) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Disability
+
+```{r}
+wrangled %>%
+  filter(!is.na(disability)) %>%
+  group_by(reddit,disability) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+## Currently unemployed
+
+```{r}
+wrangled %>%
+  mutate(unemp=ifelse(emp_status_after=="unemployed",1,0)) %>%
+  group_by(reddit,unemp) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Households with children (any age)
+
+```{r}
+wrangled %>%
+  group_by(reddit,hh_child) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Households with seniors
+
+```{r}
+wrangled %>%
+  group_by(reddit,hh_elderly) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Median income
+
+```{r}
+wrangled %>%
+  group_by(reddit,below_median) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Poverty line
+
+```{r}
+wrangled %>%
+  group_by(reddit,below_poverty) %>%
+  summarize(count=n()) %>%
+  group_by(reddit) %>%
+  mutate(per = round(count/sum(count),2),total=sum(count))
+```
+
+## Household size
+
+```{r}
+wrangled %>%
+  group_by(reddit) %>%
+  summarize(mean=mean(hh_size),median=median(hh_size),sd=sd(hh_size))
+```
