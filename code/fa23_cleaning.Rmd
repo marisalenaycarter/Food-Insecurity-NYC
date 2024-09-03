@@ -1,0 +1,250 @@
+---
+title: "Communities Speak"
+date: "01/2024"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Notebook Setup
+```{r message=FALSE, warning=FALSE}
+# Load packages
+library(googledrive)
+library(readxl)
+library(tidyverse)
+library(stringr)
+library(haven)
+library(rjson)
+library(googlesheets4)
+
+setwd("/Users/marisalenaycarter/Desktop/Food-Insecurity-NYC/code")
+getwd()
+
+# Read in custom functions
+source("code/functions/make_codebook.R")
+source("code/default_setup.R")
+```
+
+## Load data
+```{r message=FALSE, warning=FALSE}
+# Load rdata from "processed" file
+files <- list.files("../data/processed", full.names = TRUE)
+lapply(files[str_detect(files, "survey_codebook")], 
+       function(file) load(file, envir = .GlobalEnv))
+
+# Locate ID for the Google Sheets file in the Drive for the current survey data
+gs4_found <- gs4_find() # NOTE: this will list all Google SHEETS - no csv, etc
+survey_id <- gs4_found %>% filter(str_detect(name, "F23_Baseline_Survey_Feb")) %>% 
+  select(id, name)
+
+# Load data from identified Google Sheets -- removing unnecessary rows, selecting relevant columns, converting text to lowercase, expands the "recordeddate" column into separate columns for better analysis, and removing duplicate rows
+survey6 <- read_sheet(survey_id$id, sheet = "Sheet1") %>%
+  rename_all(stringr::str_to_lower) %>%
+  rename(duration = "duration (in seconds)") %>%
+  filter(row_number() > 1) %>% 
+  select(responseid, recordeddate, duration, userlanguage, source, gc, aid,
+         distributionchannel, matches("q"), # order
+         -q_language) %>%
+  mutate_at(vars(-recordeddate), ~str_to_lower(as.character(.))) %>%
+  unnest(recordeddate) %>% 
+  distinct 
+
+# Update missing values to be NA instead of character
+survey6 <- survey6 %>%
+  mutate(across(where(is.character), ~ifelse(. == "null", NA, .))) %>% 
+  mutate(across(where(is.character), ~ifelse(. == "NA", NA, .)))
+```
+
+
+## Clean data
+```{r message=FALSE, warning=FALSE}
+# Defines a function named clean_data that takes two parameters: df representing the data frame (with a default value of survey) and col representing the list of columns to be processed.
+clean_data <- function(df = survey, col = NULL) {
+#Creates a list named by_col that will store the processed data for various columns. It excludes the columns "responseid" and "recordeddate" from processing
+  by_col <- lapply(setdiff(colnames(df), c("responseid", "recordeddate")), function(col) {
+    #for (col in colnames(survey)[-1]) {
+    #Locates metadata in a data frame named survey_codebook for the column specified by col, where the "q" column contains column names
+    index <- which(survey_codebook$q == col)
+  #Parses the content from the "options" column of survey_codebook, splitting it into integers using the regex pattern "[:punct:]", representing answer choices.
+    values <- as.integer(unlist(stringr::str_split(survey_codebook$options[index], pattern = "[:punct:]")))
+#Similarly extracts labels for answer options from the "choices" column in survey_codebook.
+    tags <- unlist(str_split(survey_codebook$choices[index], "; "))
+#Determines if there are "not applicable" labels in the answer options by checking the tags. recode_na is a logical value (TRUE or FALSE) indicating whether these values need to be recoded.
+    recode_na <- any(str_detect(tags, "not applicable"))
+#If any of the labels in tags is null or if recode_na is NA (meaning it wasn't set to TRUE in the previous step), then recode_na is explicitly set to FALSE. This ensures that recode_na is either TRUE or FALSE and not NA.
+    if(any(is.null(tags), is.na(recode_na))) {
+      recode_na <- FALSE 
+    }
+# This conditional block checks if the values in the values vector are exactly equal to the vector c(1, 2). If they are, it proceeds with the following steps:
+    if(all.equal(values, c(1,2)) == TRUE & !col %in% mavr) {
+      df[[col]] <- 2 - as.integer(df[[col]]) #recoding responses to 0,1
+      values <- (2 - values) #recoding answer choices column to reflect change above
+
+# In this block, it further checks if recode_na is TRUE (meaning there were "not applicable" labels) and if the values vector is equal to c(1, 2). If both conditions are met, it performs the following actions: basically we are changing 1 to 1, and 2 to 0
+      if(recode_na & all.equal(values, c(1,2)) == TRUE) {
+        df[[col]][df[[col]] == -1] <- 2 ##unsure here...
+        values[values == -1] <- 2
+      }
+    }
+    
+    named <- setNames(values, tags) %>% na.omit #re-mapping choices (text) to the re-coded choices (numbers)
+    
+    if(is.null(tags)) {
+      named <- FALSE #where re-mapping didn't work, call those FALSE in named
+    }
+    
+    
+    if(col %in% c(likert, simple)) {
+      out <- df[c("responseid", col)] %>%
+        mutate_at(vars(col), ~labelled(as.integer(.), named)) ###leaving off here###
+      
+      # multiple answer  
+    } else if(col %in% mavr){
+      
+      sym_col <- sym(col)
+      out <- df[c("responseid", col)] %>%
+        fastDummies::dummy_cols(col, split = ",", ignore_na = TRUE) %>%
+        tidytext::unnest_tokens(output = !!sym_col, input = col, token = stringr::str_split,  pattern = ",") %>%
+        mutate_at(col, ~factor(as.integer(.), levels = values, labels = tags)) %>%
+        group_by(responseid) %>% mutate_at(col, ~paste(., collapse = ";")) %>%
+        distinct %>% mutate(across(where(is.character), ~na_if(., "NA")))
+      
+      
+      # don't double count prefer not to answer
+      # if(any(str_detect(tags, "prefer not to answer"))) {
+      #   pnta <- which(names(named) == "prefer not to answer")
+      #   pnta_col <- paste(c(col, pnta), collapse = "_")
+      #   out <- out %>% mutate_at(pnta_col,
+      #                            funs(ifelse(str_detect(!!sym_col, "prefer not to answer;|;prefer not to answer"),
+      #                                        0, !!sym(pnta_col)))) %>%
+      #     mutate_at(col, ~str_replace(., "prefer not to answer;|;prefer not to answer", ""))
+      # }
+      
+      # haven label dummies
+      cols_to_label <- out %>% ungroup %>% select_if(is.numeric) %>% colnames
+      relabelled <- lapply(cols_to_label, function(dummy){
+        i <- as.integer(str_replace(dummy, paste0(col, "_"), ""))
+        values <- c(0, 1)
+        names(values) <- c(glue::glue("not '{tags[i]}'"), tags[i])
+        #names(values) <- c(paste("not", tags[i]), tags[i])
+        out %>% ungroup %>% transmute_at(dummy, ~labelled(as.integer(.), values))
+      }) %>% reduce(bind_cols)
+      
+      out[cols_to_label] <- relabelled
+      
+      #make sure that the valus either is alpha or phone number or full zip code or every column has at least on non NA value.
+    } else if(all(!str_detect(df[[col]], "[:alpha:]|^[:digit:]{5}(\\-|\\.)[:digit:]{4}$|^[:digit:]{3}(\\-|\\.)[:digit:]{3}(\\-|\\.)[:digit:]{4}$"), na.rm = TRUE) & any(!is.na(df[[col]]))) {
+      out <- df[c("responseid", col)] %>% mutate_at(vars(col), as.integer)
+    } else {
+      out <- df[c("responseid", col)]  
+    }
+    
+     #print(paste(col, recode_na, sep = ": "))
+    #}    
+    return(out)
+  })
+  
+  by_col %>% reduce(full_join, by = c("responseid"))
+  
+}
+
+# Apply clean data function to survey data
+final_clean6 <- survey6 %>% select(responseid, recordeddate) %>% 
+  left_join(clean_data(df = survey6))
+```
+
+## Recode column names
+```{r}
+# naming survey variables
+indeces <- which(survey_codebook_labelled$q %in% colnames(final_clean6))
+key <- survey_codebook_labelled$q[indeces]
+value <- survey_codebook_labelled$full_name[indeces]
+
+# Replace column names with their common names
+names(final_clean6)[match(key, names(final_clean6))] <- value
+
+keyq_ <- colnames(final_clean6)[str_detect(colnames(final_clean6), "q[[:digit:]]{1,2}")]
+key_split <- str_split(keyq_, "_(?=[[:alpha:]])")
+pre <- unlist(lapply(key_split, first))
+suf <- unlist(lapply(key_split, last))
+
+# suf <- suf[!suf %in% pre] # removing repeats from pre
+
+#keyq <- str_replace(keyq_, "_[[:alpha:]]*$", "")
+indecesq <- match(pre, survey_codebook_labelled$q)
+valuesq <- survey_codebook_labelled$full_name[indecesq]
+valuesq_ <- paste(valuesq, suf, sep = "_")
+
+# Replace column names with their common names
+names(final_clean6)[match(keyq_, names(final_clean6))] <- valuesq_
+```
+
+## Filter out "incomplete" responses
+Incorporate new "completion" criteria: at least one demographic question and at least one policy question answered
+```{r echo=TRUE}
+# Defining demographic question group and policy question group based on block title
+demographic_qs <- survey_codebook_labelled %>% filter(grepl("new york|demo", block_title) & full_name %in% names(final_clean6)) %>% pull(full_name)
+policy_qs <- survey_codebook_labelled %>% filter(!grepl("new york|demo|closing|intro", block_title) & full_name %in% names(final_clean6)) %>% pull(full_name)
+
+# Create exclusion identifiers -- filtering the data to retain only rows with non-missing values in at least one of these categories & removing test responses
+final_clean6 <- final_clean6 %>%
+  mutate(demographic_na = rowSums(!is.na(select(., (all_of(demographic_qs))))),
+         policy_na = rowSums(!is.na(select(., all_of((policy_qs)))))) %>%
+  mutate(exclusion_reason = case_when(resi_ny != 1 ~ "not nyc resident",
+                                      !str_detect(zip, "^(100|101|102|103|104|110|111|112|113|114|116)") ~ "not nyc zipcode",
+                                      recordeddate < "2023-10-18" ~ "response before go-live",
+                                      demographic_na <= 0 ~ "no demographic qs answered",
+                                      policy_na <= 0 ~ "no policy qs answered",
+                                      str_detect(cross_1, "test") ~ "test response",
+                                      str_detect(cross_2, "test") ~ "test response",
+                                      str_detect(email, "@test.com") ~ "test response",
+                                      responseid %in% c("r_7qefevlomzh5xop") ~ "test response",
+                                      hh_sn_65 == 23 | hh_ad_18_64 == 23 | hh_ch_6_17 == 23 | hh_ch_3_5 == 23 | hh_ch_0_2 == 23 ~ "test response",
+                                      TRUE ~ "include"))
+
+# Apply filtering
+final_clean6_filtered <- final_clean6 %>% filter(exclusion_reason == "include")
+```
+
+## Save data
+```{r}
+save(final_clean6_filtered, file = "../data/processed/cleaned.rdata")
+saveRDS(final_clean6_filtered, file = "../data/processed/cleaned.rds")
+
+# Write unfiltered cleaned data to csv and google drive
+write_csv(final_clean6, file = "../data/processed/cleaned_unfiltered.csv", na = "")
+cleaned_unfiltered_data_upload <- drive_upload(
+    media = "../data/processed/cleaned_unfiltered.csv",
+    path = as_id("https://drive.google.com/drive/folders/1y8cgf5lY6kxtw-Vvs4NI3aQ3TRt9rfoF"),
+    name = "F23_cleaned_unfiltered",
+    overwrite = TRUE,
+    type = "spreadsheet"
+  )
+sheet_rename(cleaned_unfiltered_data_upload$id, new_name = "Sheet1")
+
+# Write filtered cleaned data to csv and google drive
+write_csv(final_clean6_filtered, file = "../data/processed/cleaned.csv", na = "")
+cleaned_data_upload <- drive_upload(
+    media = "../data/processed/cleaned.csv",
+    path = as_id("https://drive.google.com/drive/folders/1y8cgf5lY6kxtw-Vvs4NI3aQ3TRt9rfoF"),
+    name = "F23_cleaned",
+    overwrite = TRUE,
+    type = "spreadsheet"
+  )
+sheet_rename(cleaned_data_upload$id, new_name = "Sheet1")
+```
+
+
+## Validation
+```{r}
+# Check: # of rows filtered out
+nrow(final_clean6)
+nrow(final_clean6_filtered)
+
+# Check breakdown of filtering
+final_clean6 %>% group_by(exclusion_reason) %>% count()
+
+# Check: All questions have been mapped 
+colnames(final_clean6_filtered)[which(grepl("NA_", colnames(final_clean6_filtered)))]
+colnames(final_clean6_filtered)[which(grepl("q[0-9]", colnames(final_clean6_filtered)))]
+```
